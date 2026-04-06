@@ -148,6 +148,66 @@ def jsd_forward(
     return final_loss, dX
 
 
+@helion.kernel(ignore_warnings=[helion.exc.TensorOperationInWrapper])
+def jsd_forward_loss_only(
+    _input: Tensor,
+    target: Tensor,
+    beta: hl.constexpr = 0.5,  # type: ignore[valid-type]
+) -> Tensor:
+    """
+    Compute Jensen-Shannon Divergence loss (forward-only, no gradient).
+
+    Optimized for benchmarking: skips dX computation and uses constexpr beta
+    to eliminate dead branches at compile time.
+
+    Args:
+        _input: Student predictions in log-space, shape (BT, V)
+        target: Teacher targets in log-space, shape (BT, V)
+        beta: Coefficient for generalized JSD in [0, 1] (compile-time constant)
+
+    Returns:
+        loss: Scalar JSD loss
+    """
+    BT, V = _input.shape
+    block_size_n = hl.register_block_size(V)
+    block_size_m = hl.register_block_size(BT)
+
+    loss = torch.zeros([BT], dtype=torch.float32, device=_input.device)
+    one_minus_beta = 1 - beta
+    scale = 1.0 / float(BT)
+
+    for tile_bt in hl.tile(BT, block_size=block_size_m):
+        kl_q = hl.zeros([tile_bt, block_size_n], dtype=torch.float32)
+        kl_p = hl.zeros([tile_bt, block_size_n], dtype=torch.float32)
+        for tile_v in hl.tile(V, block_size=block_size_n):
+            X = _input[tile_bt, tile_v]
+            Y = target[tile_bt, tile_v]
+
+            if beta == 0.0:  # Forward KL: KL(P || Q)
+                Y_max = torch.amax(Y, dim=0)
+                Y_shift = Y - Y_max
+                Y_prob = torch.exp(Y_shift) * torch.exp(Y_max)
+                kl_q += Y_prob * (Y - X)
+            elif beta == 1.0:  # Reverse KL: KL(Q || P)
+                X_max = torch.amax(X, dim=0)
+                X_shift = X - X_max
+                X_prob = torch.exp(X_shift) * torch.exp(X_max)
+                kl_q += X_prob * (X - Y)
+            else:  # General JSD: beta*KL(P||M) + (1-beta)*KL(Q||M)
+                P = torch.exp(Y)
+                Q = torch.exp(X)
+                M = beta * P + one_minus_beta * Q
+                log_M = torch.log(M)
+                kl_q += Q * (X - log_M)
+                kl_p += P * (Y - log_M)
+
+        loss[tile_bt] = torch.sum(
+            (beta * kl_p + one_minus_beta * kl_q) * scale, dim=1
+        )
+
+    return torch.sum(loss)
+
+
 # %%
 # JSD Loss Module (matches liger_kernel structure)
 # ------------------------------------------------
@@ -165,6 +225,7 @@ class HelionJSD(nn.Module):
         beta: Coefficient beta ∈ [0,1]. When beta=0: forward KL, beta=1: reverse KL, beta=0.5: symmetric JSD
         ignore_index: Index to ignore in labels for masking
         dtype: Data type for loss computation
+        loss_only: If True, use the optimized forward-only kernel (no gradient, constexpr beta)
     """
 
     def __init__(
@@ -172,11 +233,13 @@ class HelionJSD(nn.Module):
         beta: float = 0.5,
         ignore_index: int = -100,
         dtype: torch.dtype = torch.float,
+        loss_only: bool = False,
     ) -> None:
         super().__init__()
         self.beta = beta
         self.ignore_index = ignore_index
         self.dtype = dtype
+        self.loss_only = loss_only
 
     def forward(
         self,
@@ -194,6 +257,10 @@ class HelionJSD(nn.Module):
         Returns:
             Scalar JSD loss
         """
+        if self.loss_only and shift_labels is None:
+            loss = jsd_forward_loss_only(_input, target, self.beta)
+            return loss.to(self.dtype)
+
         if shift_labels is not None:
             assert shift_labels.shape == (_input.shape[0],), (
                 f"the shape of shift_labels must be (BT,). Got: {shift_labels.shape}"
@@ -325,6 +392,7 @@ def jsd_tritonbench(tb_op: object, log_q: Tensor, log_p: Tensor) -> Callable:
         beta=baseline_model.beta,
         ignore_index=baseline_model.ignore_index,
         dtype=baseline_model.dtype,
+        loss_only=True,
     )
 
     return lambda: helion_jsd(log_q, log_p)
@@ -354,6 +422,19 @@ def main() -> None:
         )
         check_jsd_kernel(B, T, V, beta, ignore_index, use_labels)
         print("✓ JSD passed")
+
+    print("\nTesting optimized loss-only JSD kernel...")
+    torch_jsd = TorchJSDBaseline(beta=beta)
+    helion_jsd_opt = HelionJSD(beta=beta, loss_only=True)
+    for V in [2**i for i in range(16, 18)]:
+        log_q = torch.randn(B * T, V, device=DEVICE).log_softmax(dim=-1)
+        log_p = torch.randn(B * T, V, device=DEVICE).log_softmax(dim=-1)
+        run_example(
+            lambda q, p: helion_jsd_opt(q, p),
+            lambda q, p: torch_jsd(q, p),
+            (log_q, log_p),
+        )
+        print(f"✓ loss-only JSD passed V={V}")
 
 
 # %%
