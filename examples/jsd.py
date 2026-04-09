@@ -201,9 +201,7 @@ def jsd_forward_loss_only(
                 kl_q += Q * (X - log_M)
                 kl_p += P * (Y - log_M)
 
-        loss[tile_bt] = torch.sum(
-            (beta * kl_p + one_minus_beta * kl_q) * scale, dim=1
-        )
+        loss[tile_bt] = torch.sum((beta * kl_p + one_minus_beta * kl_q) * scale, dim=1)
 
     return torch.sum(loss)
 
