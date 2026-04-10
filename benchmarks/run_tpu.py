@@ -216,17 +216,6 @@ def _batch_softmax_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     ]
 
 
-def _softmax_shapes_basic() -> list[tuple[str, tuple[Any, ...]]]:
-    shapes = [(4096, 2560), (2048, 4096), (1024, 8192)]
-    return [
-        (
-            f"[{m},{n}]",
-            (torch.randn(m, n, device=DEVICE, dtype=torch.bfloat16),),
-        )
-        for m, n in shapes
-    ]
-
-
 def _sum_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     shapes = [(5120, 2560), (10240, 10240), (2048, 8192)]
     return [
@@ -298,13 +287,6 @@ KERNEL_MAPPINGS: dict[str, KernelMapping] = {
         "batch_softmax",
         functools.partial(torch.softmax, dim=-1),
         _batch_softmax_shapes,
-        None,
-    ),
-    "softmax": (
-        "softmax",
-        "softmax",
-        functools.partial(torch.softmax, dim=-1),
-        _softmax_shapes_basic,
         None,
     ),
     "sum": (
