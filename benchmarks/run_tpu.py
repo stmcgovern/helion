@@ -216,6 +216,26 @@ def _batch_softmax_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     ]
 
 
+def _rms_norm_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+    configs = [(2048, 4096), (2048, 8192), (4096, 4096)]
+    return [
+        (
+            f"[{m},{n}]",
+            (
+                torch.randn(m, n, device=DEVICE, dtype=torch.bfloat16),
+                torch.randn(n, device=DEVICE, dtype=torch.bfloat16),
+            ),
+        )
+        for m, n in configs
+    ]
+
+
+def _rms_norm_baseline(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    hidden = x.to(torch.float32)
+    variance = hidden.pow(2).mean(-1, keepdim=True)
+    return (weight * (hidden * torch.rsqrt(variance + 1e-5))).to(x.dtype)
+
+
 def _sum_shapes() -> list[tuple[str, tuple[Any, ...]]]:
     shapes = [(5120, 2560), (10240, 10240), (2048, 8192)]
     return [
@@ -294,6 +314,15 @@ KERNEL_MAPPINGS: dict[str, KernelMapping] = {
         "sum_kernel",
         functools.partial(torch.sum, dim=-1),
         _sum_shapes,
+        None,
+    ),
+    # rms_norm_fwd returns (output, inv_rms); the _unwrap_first wrapper in
+    # run_kernel_inner extracts just the first element for run_example.
+    "rms_norm": (
+        "rms_norm",
+        "rms_norm_fwd",
+        _rms_norm_baseline,
+        _rms_norm_shapes,
         None,
     ),
 }
@@ -395,6 +424,17 @@ def run_kernel_inner(name: str) -> KernelResult:
             shapes = shapes[:NUM_SHAPES]
         all_passed = True
         shape_results: list[ShapeResult] = []
+
+        # Wrap kernel functions that return tuples so run_example sees a single tensor
+        def _unwrap_first(fn: Callable[..., Any]) -> Callable[..., torch.Tensor]:
+            @functools.wraps(fn)
+            def wrapper(*a: object) -> torch.Tensor:
+                result = fn(*a)
+                return result[0] if isinstance(result, tuple) else result
+
+            return wrapper
+
+        kernel_fn = _unwrap_first(kernel_fn)
 
         for label, args in shapes:
             print(f"  Shape {label}:", file=sys.stderr)
