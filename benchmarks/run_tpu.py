@@ -205,6 +205,39 @@ def _swiglu_baseline(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return nn.functional.silu(a).to(b.dtype) * b
 
 
+def _batch_softmax_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+    configs = [(16, 512, 1024), (8, 256, 2048), (4, 1024, 512)]
+    return [
+        (
+            f"[{b},{m},{n}]",
+            (torch.randn(b, m, n, device=DEVICE, dtype=torch.bfloat16),),
+        )
+        for b, m, n in configs
+    ]
+
+
+def _softmax_shapes_basic() -> list[tuple[str, tuple[Any, ...]]]:
+    shapes = [(4096, 2560), (2048, 4096), (1024, 8192)]
+    return [
+        (
+            f"[{m},{n}]",
+            (torch.randn(m, n, device=DEVICE, dtype=torch.bfloat16),),
+        )
+        for m, n in shapes
+    ]
+
+
+def _sum_shapes() -> list[tuple[str, tuple[Any, ...]]]:
+    shapes = [(5120, 2560), (10240, 10240), (2048, 8192)]
+    return [
+        (
+            f"[{m},{n}]",
+            (torch.randn(m, n, device=DEVICE, dtype=torch.bfloat16),),
+        )
+        for m, n in shapes
+    ]
+
+
 # Kernel mappings for TPU/Pallas benchmarks.
 # Format: kernel_name -> (module_file, kernel_fn_name, baseline_fn, shapes_fn,
 #                         max_mismatch_pct)
@@ -260,6 +293,27 @@ KERNEL_MAPPINGS: dict[str, KernelMapping] = {
         1.0,
     ),
     "swiglu": ("swiglu", "swiglu_fwd", _swiglu_baseline, _swiglu_shapes, None),
+    "batch_softmax": (
+        "batch_softmax",
+        "batch_softmax",
+        functools.partial(torch.softmax, dim=-1),
+        _batch_softmax_shapes,
+        None,
+    ),
+    "softmax": (
+        "softmax",
+        "softmax",
+        functools.partial(torch.softmax, dim=-1),
+        _softmax_shapes_basic,
+        None,
+    ),
+    "sum": (
+        "sum",
+        "sum_kernel",
+        functools.partial(torch.sum, dim=-1),
+        _sum_shapes,
+        None,
+    ),
 }
 
 
