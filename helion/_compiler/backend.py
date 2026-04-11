@@ -1592,6 +1592,16 @@ class PallasBackend(Backend):
         except Exception:
             return self.default_launcher_name
 
+    def pre_codegen(
+        self,
+        graphs: list[GraphInfo],
+        config: Config,
+        tile_strategy: TileStrategyDispatch,
+    ) -> None:
+        from .pallas.plan_tiling import plan_tiling
+
+        plan_tiling(graphs, config, tile_strategy)
+
 
 def _detect_mma_loop(
     fn: DeviceFunction,
