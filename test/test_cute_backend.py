@@ -3,16 +3,20 @@ from __future__ import annotations
 import os
 from unittest.mock import patch
 
+import cutlass
+import cutlass.cute as cute
 import torch
 
 import helion
 from helion._compiler.cute.mma_support import get_cute_mma_support
+from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_tree
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 import helion.language as hl
+from helion.runtime import default_cute_launcher
 
 
 @helion.kernel(backend="cute")
@@ -169,6 +173,103 @@ def cute_row_prod(x: torch.Tensor) -> torch.Tensor:
             row_prod = row_prod * torch.prod(vals, dim=1)
         out[tile_n] = row_prod
     return out
+
+
+@cute.kernel
+def cute_shared_tree_reduce_max(inp, out):
+    lane = cutlass.Int32(cute.arch.thread_idx()[0]) + cutlass.Int32(
+        cute.arch.thread_idx()[1]
+    ) * cutlass.Int32(3)
+    lane_in_group = lane % 48
+    lane_mod_pre = lane_in_group % 3
+    reduce_idx = lane_in_group // 3
+    result = _cute_grouped_reduce_shared_tree(
+        inp[lane_mod_pre, reduce_idx],
+        "max",
+        cutlass.Float32(float("-inf")),
+        lane,
+        lane_in_group,
+        lane_mod_pre,
+        pre=3,
+        group_span=48,
+        num_threads=48,
+        group_count=1,
+    )
+    if lane_in_group < 3:
+        out[lane_in_group] = result
+
+
+@cute.kernel
+def cute_shared_tree_reduce_min(inp, out):
+    lane = cutlass.Int32(cute.arch.thread_idx()[0]) + cutlass.Int32(
+        cute.arch.thread_idx()[1]
+    ) * cutlass.Int32(3)
+    lane_in_group = lane % 48
+    lane_mod_pre = lane_in_group % 3
+    reduce_idx = lane_in_group // 3
+    result = _cute_grouped_reduce_shared_tree(
+        inp[lane_mod_pre, reduce_idx],
+        "min",
+        cutlass.Float32(float("inf")),
+        lane,
+        lane_in_group,
+        lane_mod_pre,
+        pre=3,
+        group_span=48,
+        num_threads=48,
+        group_count=1,
+    )
+    if lane_in_group < 3:
+        out[lane_in_group] = result
+
+
+@cute.kernel
+def cute_shared_tree_reduce_prod(inp, out):
+    lane = cutlass.Int32(cute.arch.thread_idx()[0]) + cutlass.Int32(
+        cute.arch.thread_idx()[1]
+    ) * cutlass.Int32(3)
+    lane_in_group = lane % 48
+    lane_mod_pre = lane_in_group % 3
+    reduce_idx = lane_in_group // 3
+    result = _cute_grouped_reduce_shared_tree(
+        inp[lane_mod_pre, reduce_idx],
+        "prod",
+        cutlass.Float32(1.0),
+        lane,
+        lane_in_group,
+        lane_mod_pre,
+        pre=3,
+        group_span=48,
+        num_threads=48,
+        group_count=1,
+    )
+    if lane_in_group < 3:
+        out[lane_in_group] = result
+
+
+@cute.kernel
+def cute_shared_tree_matmul_sum(lhs, rhs, out):
+    lane = cutlass.Int32(cute.arch.thread_idx()[0]) + cutlass.Int32(
+        cute.arch.thread_idx()[1]
+    ) * cutlass.Int32(3)
+    lane_in_group = lane % 48
+    row = lane_in_group % 3
+    reduce_idx = lane_in_group // 3
+    product = lhs[row, reduce_idx] * rhs[reduce_idx, cutlass.Int32(0)]
+    result = _cute_grouped_reduce_shared_tree(
+        product,
+        "sum",
+        cutlass.Float32(0.0),
+        lane,
+        lane_in_group,
+        row,
+        pre=3,
+        group_span=48,
+        num_threads=48,
+        group_count=1,
+    )
+    if lane_in_group < 3:
+        out[row, cutlass.Int32(0)] = result
 
 
 @helion.kernel(backend="cute")
@@ -707,6 +808,28 @@ class TestCuteBackend(TestCase):
                 _code, out = code_and_output(kernel, args, block_sizes=[2, 8])
                 torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
 
+    def test_direct_shared_tree_reduce_helpers_non_sum(self) -> None:
+        x = torch.rand(3, 16, device=DEVICE, dtype=torch.float32) + 0.5
+        cases = [
+            (
+                cute_shared_tree_reduce_max,
+                torch.amax(x.to(torch.float32), dim=1),
+            ),
+            (
+                cute_shared_tree_reduce_min,
+                torch.amin(x.to(torch.float32), dim=1),
+            ),
+            (
+                cute_shared_tree_reduce_prod,
+                torch.prod(x.to(torch.float32), dim=1),
+            ),
+        ]
+        for kernel, expected in cases:
+            with self.subTest(kernel=kernel.__name__):
+                out = torch.empty_like(expected)
+                default_cute_launcher(kernel, (1,), x, out, block=(3, 16, 1))
+                torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
+
     def test_permute_transposes_tile_values(self) -> None:
         """Permute should shuffle scalar values between threads."""
 
@@ -1003,6 +1126,15 @@ class TestCuteBackend(TestCase):
         self.assertIn("cute.arch.warp_reduction_sum", code)
         self.assertNotIn("cute.gemm", code)
 
+    def test_direct_shared_tree_sum_matches_matmul_lane_mapping(self) -> None:
+        lhs = torch.randn(3, 16, device=DEVICE, dtype=torch.float32)
+        rhs = torch.randn(16, 1, device=DEVICE, dtype=torch.float32)
+        out = torch.empty(3, 1, device=DEVICE, dtype=torch.float32)
+        default_cute_launcher(
+            cute_shared_tree_matmul_sum, (1,), lhs, rhs, out, block=(3, 16, 1)
+        )
+        torch.testing.assert_close(out, lhs @ rhs, atol=1e-5, rtol=1e-5)
+
     def test_addmm_direct_full_k_tile_falls_back_correctly(self) -> None:
         args = (
             torch.randn(4, 4, device=DEVICE, dtype=torch.float32),
@@ -1164,5 +1296,4 @@ class TestCuteBackend(TestCase):
         expected = x[:, : end.item()].sum(dim=1)
         torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
         self.assertIn("block=(32, 32, 1)", code)
-        self.assertIn("cute.arch.alloc_smem", code)
-        self.assertIn("cute.arch.sync_threads()", code)
+        self.assertIn("_cute_grouped_reduce_shared_two_stage", code)
