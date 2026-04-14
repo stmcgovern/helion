@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import suppress
 import contextvars
+import hashlib
 import linecache
 import sys
 from typing import Any
@@ -249,47 +250,45 @@ def _pallas_build_block_specs(
     output_indices: list[int],
     block_spec_info: _BlockSpecInfo | None = None,
     _smem_arg_indices: list[int] | None = None,
-    _output_only_set: set[int] | None = None,
+    output_only_indices: list[int] | None = None,
 ) -> tuple[list[object] | None, object | None]:
     """Build ``in_specs`` and ``out_specs`` for ``pl.pallas_call``.
 
-    Output-only tensors (in ``_output_only_set``) get HBM in_specs
-    to avoid VMEM pressure while keeping VMEM out_specs for writes.
+    ``block_spec_info`` is indexed by position among *all* tensor args.
+    ``output_only_indices`` lists tensor positions excluded from
+    ``tensor_arg_indices``; they are merged back to compute the mapping.
     """
     if block_spec_info is None or len(grid) == 0:
         return None, None
 
-    output_only_set = _output_only_set or set()
+    all_positions = sorted(set(tensor_arg_indices) | set(output_only_indices or []))
+    all_arg_to_tensor_pos = {orig: tpos for tpos, orig in enumerate(all_positions)}
 
     in_specs = []
-    for tensor_pos, idx in enumerate(tensor_arg_indices):
+    for idx in tensor_arg_indices:
         t = args[idx]
         assert isinstance(t, torch.Tensor)
-        if idx in output_only_set:
-            in_specs.append(pl.BlockSpec(memory_space=pl.ANY))  # type: ignore[union-attr]
-        else:
-            should_use_smem = tensor_pos in (_smem_arg_indices or [])
-            in_specs.append(
-                _pallas_make_block_spec(
-                    pl, jnp, pltpu, t, block_spec_info[tensor_pos], should_use_smem
-                )
+        tensor_pos = all_arg_to_tensor_pos[idx]
+        should_use_smem = tensor_pos in (_smem_arg_indices or [])
+        in_specs.append(
+            _pallas_make_block_spec(
+                pl, jnp, pltpu, t, block_spec_info[tensor_pos], should_use_smem
             )
+        )
 
-    arg_to_tensor_pos = {orig: tpos for tpos, orig in enumerate(tensor_arg_indices)}
     out_specs_list = []
     for idx in output_indices:
         t = args[idx]
         assert isinstance(t, torch.Tensor)
-        # Output-only tensors keep VMEM out_specs so the kernel can write
-        # to them; only their in_specs use HBM to avoid VMEM pressure.
-        should_use_smem = arg_to_tensor_pos[idx] in (_smem_arg_indices or [])
+        tensor_pos = all_arg_to_tensor_pos[idx]
+        should_use_smem = tensor_pos in (_smem_arg_indices or [])
         out_specs_list.append(
             _pallas_make_block_spec(
                 pl,
                 jnp,
                 pltpu,
                 t,
-                block_spec_info[arg_to_tensor_pos[idx]],
+                block_spec_info[tensor_pos],
                 should_use_smem,
             )
         )
@@ -308,6 +307,7 @@ def _pallas_build_pipeline_specs(
     output_indices: list[int],
     block_spec_info: _BlockSpecInfo | None,
     pipeline_arg_indices: list[int] | None,
+    output_only_indices: list[int] | None = None,
 ) -> tuple[list[object], object]:
     """Build in/out specs for pipeline launchers.
 
@@ -315,7 +315,8 @@ def _pallas_build_pipeline_specs(
     All other tensors get proper BlockSpecs for automatic VMEM prefetch.
     """
     pipeline_set = set(pipeline_arg_indices or [])
-    arg_to_tpos = {orig: tpos for tpos, orig in enumerate(tensor_arg_indices)}
+    all_positions = sorted(set(tensor_arg_indices) | set(output_only_indices or []))
+    arg_to_tpos = {orig: tpos for tpos, orig in enumerate(all_positions)}
 
     def _spec_for(idx: int) -> object:
         if idx in pipeline_set:
@@ -350,25 +351,29 @@ def _jax_placeholder_for_tensor(t: torch.Tensor) -> object:
 def _pallas_prepare_args(
     args: tuple[object, ...],
     _output_indices: list[int],
+    _inplace_indices: list[int] | None = None,
+    _output_only_tensors: list[object] | None = None,
 ) -> tuple[
-    set[int],
+    tuple[object, ...],
+    list[int],
     list[int],
     dict[int, object],
     int,
     dict[int, int],
-    list[object],
     set[int],
     tuple[object, ...],
 ]:
     """Extract and organize tensor/non-tensor args for Pallas launchers.
 
+    When output-only tensors are excluded from ``args``, they are passed
+    separately via ``_output_only_tensors`` for shape/dtype information.
+
     Returns a tuple of:
-    - output_set: set of output arg positions
-    - tensor_arg_indices: positions of tensor args
+    - tensor_arg_indices: positions of tensor args passed as pallas_call inputs
+    - output_only_indices: original positions of output-only tensors
     - non_tensor_args: mapping of non-tensor arg positions to values
-    - n_tensor_inputs: count of tensor args
+    - n_tensor_inputs: count of tensor inputs (excl. output-only)
     - arg_to_tensor_pos: mapping from original position to tensor-only position
-    - outputs: list of output tensors
     - inplace_positions: positions that are both input and output
     - out_shapes: JAX placeholders for output shapes
     """
@@ -384,25 +389,40 @@ def _pallas_prepare_args(
         placeholder_fn = jax_placeholder
 
     output_set = set(_output_indices)
-    tensor_arg_indices = [
+    inplace_set = set(_inplace_indices) if _inplace_indices is not None else output_set
+    output_only = output_set - inplace_set
+
+    # Reconstruct full args by inserting output-only tensors at their
+    # original positions.  This keeps all downstream index-based logic
+    # (block specs, reordered kernel, etc.) unchanged.
+    if _output_only_tensors and output_only:
+        full_args: list[object] = list(args)
+        oo_iter = iter(_output_only_tensors)
+        for orig_pos in sorted(output_only):
+            full_args.insert(orig_pos, next(oo_iter))
+        args = tuple(full_args)
+
+    all_tensor_positions = [
         i for i in range(len(args)) if isinstance(args[i], torch.Tensor)
     ]
+    output_only_indices = [i for i in all_tensor_positions if i in output_only]
+    tensor_arg_indices = [i for i in all_tensor_positions if i not in output_only]
+
     non_tensor_args: dict[int, object] = {
         i: args[i] for i in range(len(args)) if not isinstance(args[i], torch.Tensor)
     }
     n_tensor_inputs = len(tensor_arg_indices)
     arg_to_tensor_pos = {orig: tpos for tpos, orig in enumerate(tensor_arg_indices)}
-    outputs = [args[i] for i in _output_indices]
     inplace_positions = output_set & set(tensor_arg_indices)
-    out_shapes = tuple(placeholder_fn(out) for out in outputs)  # type: ignore[arg-type]
+    out_shapes = tuple(placeholder_fn(args[i]) for i in _output_indices)  # type: ignore[arg-type]
 
     return (
-        output_set,
+        args,
         tensor_arg_indices,
+        output_only_indices,
         non_tensor_args,
         n_tensor_inputs,
         arg_to_tensor_pos,
-        outputs,
         inplace_positions,
         out_shapes,
     )
@@ -429,10 +449,9 @@ def _pallas_make_reordered_kernel(
     reordered args.
 
     *skip_inplace_copy* is a set of original-arg positions for which the
-    initial ``out_ref[...] = in_ref[...]`` copy should be skipped.  This is
-    needed for outputs backed by HBM refs (``pl.ANY``) where direct
-    load/store is not allowed.  Outputs with VMEM BlockSpecs still get the
-    copy so that ``input_output_aliases`` correctly preloads their contents.
+    initial ``out_ref[...] = in_ref[...]`` copy should be skipped.  Used by
+    pipeline/fori launchers for pipeline-body tensors backed by HBM refs
+    where direct load/store is not allowed.
     """
     _skip_copy = skip_inplace_copy or set()
 
@@ -478,11 +497,19 @@ def _pallas_build_callable(
     """
 
     def _make_interpret_callable() -> _PallasInterpretCallable:
-        output_tensor_positions = [
-            arg_to_tensor_pos[orig_pos] for orig_pos in _output_indices
+        # Map (out_idx in _output_indices) -> tensor_pos for inplace outputs.
+        # out_idx must match jax_results ordering (all outputs), not filtered.
+        inplace_output_mapping = [
+            (out_idx, arg_to_tensor_pos[orig_pos])
+            for out_idx, orig_pos in enumerate(_output_indices)
+            if orig_pos in arg_to_tensor_pos
         ]
-        callable_obj = _PallasInterpretCallable(jit_fn, output_tensor_positions)
-        setattr(pallas_kernel, cache_attr, (grid, callable_obj, tensor_arg_indices))
+        callable_obj = _PallasInterpretCallable(jit_fn, inplace_output_mapping)
+        setattr(
+            pallas_kernel,
+            cache_attr,
+            (grid, callable_obj, tensor_arg_indices, arg_to_tensor_pos),
+        )
         return callable_obj
 
     if _pallas_interpret_flag():
@@ -497,7 +524,8 @@ def _pallas_build_callable(
 
     call_aliases: dict[int, int] = {}
     for out_idx, orig_pos in enumerate(_output_indices):
-        call_aliases[arg_to_tensor_pos[orig_pos]] = out_idx
+        if orig_pos in arg_to_tensor_pos:
+            call_aliases[arg_to_tensor_pos[orig_pos]] = out_idx
 
     jax_callable = JaxCallable(
         name=kernel_name,
@@ -505,38 +533,54 @@ def _pallas_build_callable(
         trace_key=f"{kernel_name}_{id(pallas_kernel)}_{grid}{trace_key_suffix}",
         input_output_aliases=call_aliases,
     )
-    setattr(pallas_kernel, cache_attr, (grid, jax_callable, tensor_arg_indices))
+    setattr(
+        pallas_kernel,
+        cache_attr,
+        (grid, jax_callable, tensor_arg_indices, arg_to_tensor_pos),
+    )
     return jax_callable
 
 
 class _PallasInterpretCallable:
     """Thin wrapper that converts torch tensors <-> JAX arrays for interpret mode.
 
-    ``pallas_call`` with ``input_output_aliases`` returns new JAX arrays for the
-    outputs.  This wrapper copies those results back into the original torch
-    output tensors (identified by ``output_tensor_positions``).
+    In interpret mode, ``pallas_call`` runs on CPU and returns JAX arrays.
+    This wrapper:
+    1. Converts input torch tensors to JAX arrays
+    2. Runs the pallas_call function
+    3. For inplace outputs (donated tensors): copies JAX results back into
+       the original torch tensors via ``copy_()``
+    4. Returns raw JAX results so ``_pallas_invoke_and_return`` can
+       handle output-only tensors (which are not in the input list)
+
+    ``inplace_output_mapping`` maps each inplace output to its JAX result:
+    a list of ``(out_idx, tensor_pos)`` where ``out_idx`` indexes into
+    ``jax_results`` and ``tensor_pos`` indexes into ``input_tensors``.
     """
 
     def __init__(
         self,
         jit_fn: object,
-        output_tensor_positions: list[int],
+        inplace_output_mapping: list[tuple[int, int]],
     ) -> None:
         self._jit_fn = jit_fn
-        self._output_tensor_positions = output_tensor_positions
+        self._inplace_output_mapping = inplace_output_mapping
 
-    def __call__(self, *input_tensors: torch.Tensor) -> None:
+    def __call__(self, *input_tensors: torch.Tensor) -> tuple[object, ...]:
         jax_inputs = [_torch_to_jax(t) for t in input_tensors]
         jax_results = self._jit_fn(*jax_inputs)  # type: ignore[operator]
         if not isinstance(jax_results, (tuple, list)):
             jax_results = (jax_results,)
-        # Write results back into the original output tensors.
-        for out_idx, tensor_pos in enumerate(self._output_tensor_positions):
+        # Write inplace results back into the original output tensors.
+        for out_idx, tensor_pos in self._inplace_output_mapping:
             out_tensor = input_tensors[tensor_pos]
             result_data = _jax_to_torch(
                 jax_results[out_idx], device=out_tensor.device, dtype=out_tensor.dtype
             )
             out_tensor.copy_(result_data)
+        # Return JAX results so output-only tensors can be handled
+        # by _pallas_invoke_and_return.
+        return tuple(jax_results)
 
 
 def _pallas_interpret_flag() -> bool:
@@ -567,16 +611,62 @@ def _ensure_cpu_tpu_info() -> None:
         registry["cpu"] = lambda: _get_tpu_info_impl(ChipVersion.TPU_7X, 1)
 
 
+def _pallas_invoke_and_return(
+    jax_callable: object,
+    args: tuple[object, ...],
+    tensor_arg_indices: list[int],
+    arg_to_tensor_pos: dict[int, int],
+    _output_indices: list[int],
+) -> object:
+    """Run the JaxCallable and return output-only results.
+
+    Output-only tensors (those not in ``arg_to_tensor_pos``) are not passed
+    as pallas_call inputs, so the JaxCallable returns new buffers for them.
+    Returns a single tensor, a tuple of tensors, or None.
+    """
+    input_tensors = [
+        cast("torch.Tensor", args[i]).contiguous() for i in tensor_arg_indices
+    ]
+    results = jax_callable(*input_tensors)  # type: ignore[operator]
+    if results is None:
+        return None
+    if not isinstance(results, (tuple, list)):
+        results = (results,)
+    output_only_results: list[torch.Tensor] = []
+    for out_idx, orig_pos in enumerate(_output_indices):
+        if orig_pos not in arg_to_tensor_pos:
+            result = results[out_idx]
+            if not isinstance(result, torch.Tensor):
+                # Interpret mode: pallas_call returns JAX arrays, convert to torch.
+                # On TPU, JaxCallable returns torch tensors directly.
+                import numpy as np
+
+                jax_dtype = result.dtype  # type: ignore[union-attr]
+                torch_dtype = torch.from_numpy(np.empty(0, dtype=jax_dtype)).dtype
+                result = _jax_to_torch(
+                    result,
+                    device=torch.device("cpu"),
+                    dtype=torch_dtype,
+                )
+            output_only_results.append(result)
+    if not output_only_results:
+        return None
+    if len(output_only_results) == 1:
+        return output_only_results[0]
+    return tuple(output_only_results)
+
+
 def default_pallas_launcher(
     pallas_kernel: object,
     grid: tuple[int, ...],
     *args: object,
     _output_indices: list[int] | None = None,
     _inplace_indices: list[int] | None = None,
+    _output_only_tensors: list[object] | None = None,
     _block_spec_info: _BlockSpecInfo | None = None,
     _smem_arg_indices: list[int] | None = None,
     **kwargs: object,
-) -> None:
+) -> object:
     """Default launcher for Pallas kernels on TPU (or CPU with interpret=True).
 
     Uses ``JaxCallable`` from ``torch_tpu`` to compile and run the Pallas
@@ -586,37 +676,32 @@ def default_pallas_launcher(
     buffers (zero-copy on TPU).
 
     Output-only tensors (in ``_output_indices`` but not in ``_inplace_indices``)
-    get HBM in_specs to avoid VMEM pressure while still being donated.
+    are excluded from pallas_call inputs to save VMEM.  Their results are
+    returned as torch tensors.
     """
     if _output_indices is None:
         _output_indices = []
 
     cache = getattr(pallas_kernel, "_pallas_cache", None)
     if cache is not None and cache[0] == grid:
-        _, jax_callable, tensor_arg_indices = cache
+        _, jax_callable, tensor_arg_indices, arg_to_tensor_pos = cache
     else:
         from jax.experimental import pallas as pl
         from jax.experimental.pallas import tpu as pltpu
         import jax.numpy as jnp
 
         (
-            output_set,
+            args,
             tensor_arg_indices,
+            output_only_indices,
             non_tensor_args,
             n_tensor_inputs,
             arg_to_tensor_pos,
-            outputs,
             inplace_positions,
             out_shapes,
-        ) = _pallas_prepare_args(args, _output_indices)
-
-        # Derive output-only set: outputs not in _inplace_indices.
-        inplace_set = (
-            set(_inplace_indices)
-            if _inplace_indices is not None
-            else set(_output_indices)
+        ) = _pallas_prepare_args(
+            args, _output_indices, _inplace_indices, _output_only_tensors
         )
-        output_only_set = set(_output_indices) - inplace_set
 
         in_specs, out_specs = _pallas_build_block_specs(
             pl,
@@ -628,7 +713,7 @@ def default_pallas_launcher(
             _output_indices,
             _block_spec_info,
             _smem_arg_indices,
-            output_only_set,
+            output_only_indices,
         )
 
         reordered_kernel = _pallas_make_reordered_kernel(
@@ -641,7 +726,6 @@ def default_pallas_launcher(
             inplace_positions,
             arg_to_tensor_pos,
             _smem_arg_indices=_smem_arg_indices,
-            skip_inplace_copy=output_only_set,
         )
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
@@ -649,6 +733,7 @@ def default_pallas_launcher(
         pallas_aliases = {
             arg_to_tensor_pos[orig_pos]: out_idx
             for out_idx, orig_pos in enumerate(_output_indices)
+            if orig_pos in arg_to_tensor_pos
         }
 
         pallas_call_kwargs: dict[str, object] = {
@@ -677,10 +762,9 @@ def default_pallas_launcher(
             cache_attr="_pallas_cache",
         )
 
-    input_tensors = [
-        cast("torch.Tensor", args[i]).contiguous() for i in tensor_arg_indices
-    ]
-    jax_callable(*input_tensors)  # type: ignore[operator]
+    return _pallas_invoke_and_return(
+        jax_callable, args, tensor_arg_indices, arg_to_tensor_pos, _output_indices
+    )
 
 
 def default_pallas_pipeline_launcher(
@@ -688,11 +772,13 @@ def default_pallas_pipeline_launcher(
     grid: tuple[int, ...],
     *args: object,
     _output_indices: list[int] | None = None,
+    _inplace_indices: list[int] | None = None,
+    _output_only_tensors: list[object] | None = None,
     _block_spec_info: _BlockSpecInfo | None = None,
     _scratch_shapes: list[tuple[tuple[int, ...], str]] | None = None,
     _pipeline_arg_indices: list[int] | None = None,
     **kwargs: object,
-) -> None:
+) -> object:
     """Launcher for Pallas kernels using PrefetchScalarGridSpec with scratch memory.
 
     Used when ``pallas_loop_type='emit_pipeline'``.  Pipeline-body tensors
@@ -706,22 +792,24 @@ def default_pallas_pipeline_launcher(
 
     cache = getattr(pallas_kernel, "_pallas_pipeline_cache", None)
     if cache is not None and cache[0] == grid:
-        _, jax_callable, tensor_arg_indices = cache
+        _, jax_callable, tensor_arg_indices, arg_to_tensor_pos = cache
     else:
         from jax.experimental import pallas as pl
         from jax.experimental.pallas import tpu as pltpu
         import jax.numpy as jnp
 
         (
-            output_set,
+            args,
             tensor_arg_indices,
+            output_only_indices,
             non_tensor_args,
             n_tensor_inputs,
             arg_to_tensor_pos,
-            outputs,
             inplace_positions,
             out_shapes,
-        ) = _pallas_prepare_args(args, _output_indices)
+        ) = _pallas_prepare_args(
+            args, _output_indices, _inplace_indices, _output_only_tensors
+        )
 
         # Build scratch shapes for VMEM
         _jnp_dtype_map: dict[str, object] = {
@@ -759,6 +847,7 @@ def default_pallas_pipeline_launcher(
             _output_indices,
             _block_spec_info,
             _pipeline_arg_indices,
+            output_only_indices,
         )
 
         _pipeline_set = set(_pipeline_arg_indices or [])
@@ -780,6 +869,7 @@ def default_pallas_pipeline_launcher(
         pallas_aliases = {
             arg_to_tensor_pos[orig_pos]: out_idx
             for out_idx, orig_pos in enumerate(_output_indices)
+            if orig_pos in arg_to_tensor_pos
         }
 
         grid_spec = pltpu.PrefetchScalarGridSpec(
@@ -817,10 +907,9 @@ def default_pallas_pipeline_launcher(
             trace_key_suffix="_pipeline",
         )
 
-    input_tensors = [
-        cast("torch.Tensor", args[i]).contiguous() for i in tensor_arg_indices
-    ]
-    jax_callable(*input_tensors)  # type: ignore[operator]
+    return _pallas_invoke_and_return(
+        jax_callable, args, tensor_arg_indices, arg_to_tensor_pos, _output_indices
+    )
 
 
 def default_pallas_fori_launcher(
@@ -828,10 +917,12 @@ def default_pallas_fori_launcher(
     grid: tuple[int, ...],
     *args: object,
     _output_indices: list[int] | None = None,
+    _inplace_indices: list[int] | None = None,
+    _output_only_tensors: list[object] | None = None,
     _block_spec_info: _BlockSpecInfo | None = None,
     _scratch_shapes: list[tuple[tuple[int, ...], str | None, str]] | None = None,
     **kwargs: object,
-) -> None:
+) -> object:
     """Launcher for Pallas kernels using fori_loop with manual DMA.
 
     Used when ``pallas_loop_type="fori_loop"``.  Passes all tensors as
@@ -847,22 +938,24 @@ def default_pallas_fori_launcher(
 
     cache = getattr(pallas_kernel, "_pallas_fori_cache", None)
     if cache is not None and cache[0] == grid:
-        _, jax_callable, tensor_arg_indices = cache
+        _, jax_callable, tensor_arg_indices, arg_to_tensor_pos = cache
     else:
         from jax.experimental import pallas as pl
         from jax.experimental.pallas import tpu as pltpu
         import jax.numpy as jnp
 
         (
-            output_set,
+            args,
             tensor_arg_indices,
+            output_only_indices,
             non_tensor_args,
             n_tensor_inputs,
             arg_to_tensor_pos,
-            outputs,
             inplace_positions,
             out_shapes,
-        ) = _pallas_prepare_args(args, _output_indices)
+        ) = _pallas_prepare_args(
+            args, _output_indices, _inplace_indices, _output_only_tensors
+        )
 
         # Build scratch shapes: VMEM buffers + DMA semaphores
         _jnp_dtype_map: dict[str, object] = {
@@ -899,6 +992,7 @@ def default_pallas_fori_launcher(
             _output_indices,
             _block_spec_info,
             _fori_pipeline_indices,  # type: ignore[arg-type]
+            output_only_indices,
         )
 
         _fori_pipeline_set = set(_fori_pipeline_indices or [])  # type: ignore[arg-type]
@@ -920,6 +1014,7 @@ def default_pallas_fori_launcher(
         pallas_aliases = {
             arg_to_tensor_pos[orig_pos]: out_idx
             for out_idx, orig_pos in enumerate(_output_indices)
+            if orig_pos in arg_to_tensor_pos
         }
 
         grid_spec = pltpu.PrefetchScalarGridSpec(
@@ -957,10 +1052,9 @@ def default_pallas_fori_launcher(
             trace_key_suffix="_fori",
         )
 
-    input_tensors = [
-        cast("torch.Tensor", args[i]).contiguous() for i in tensor_arg_indices
-    ]
-    jax_callable(*input_tensors)  # type: ignore[operator]
+    return _pallas_invoke_and_return(
+        jax_callable, args, tensor_arg_indices, arg_to_tensor_pos, _output_indices
+    )
 
 
 def _torch_to_jax(t: torch.Tensor) -> object:
@@ -1207,20 +1301,16 @@ def default_metal_launcher(
     metal_kernel: object,
     grid: tuple[int, ...],
     *args: object,
-    _block_dims: tuple[int, int, int] = (256, 1, 1),
+    _block_size: int = 256,
     **kwargs: object,
 ) -> None:
     """Default launcher for Metal kernels on Apple MPS devices.
 
-    The ``metal_kernel`` is a ``@metal_jit`` decorated function that
-    translates its Python AST body to MSL and compiles it via
-    ``torch.mps.compile_shader`` on each call.
-    This launcher dispatches the compiled kernel with the given grid and
-    threadgroup dimensions.
+    Compiles MSL source via ``torch.mps.compile_shader()`` and dispatches
+    using the compiled library.  Caches the compiled library on the kernel
+    object to avoid recompilation on subsequent calls.
 
-    Uses a 3D threadgroup dispatch model: ``_block_dims`` specifies the
-    threadgroup size as ``(x, y, z)``.  The grid specifies the number of
-    threadgroups per dimension.
+    Only 1D grids are currently supported.
     """
     kwargs.pop("num_warps", None)
     kwargs.pop("num_stages", None)
@@ -1229,15 +1319,20 @@ def default_metal_launcher(
             "metal", f"unexpected launcher kwargs: {sorted(kwargs)}"
         )
 
-    lib, kernel_name = metal_kernel(*args)  # type: ignore[operator]
+    assert len(grid) == 1, (
+        f"Metal launcher only supports 1D grids, got {len(grid)}D: {grid}"
+    )
+
+    msl_source, kernel_name = metal_kernel()  # type: ignore[operator]
+    source_hash = hashlib.sha256(msl_source.encode()).digest()
+    cache = getattr(metal_kernel, "_metal_cache", None)
+    if cache is not None and cache[0] == source_hash:
+        lib = cache[1]
+    else:
+        lib = torch.mps.compile_shader(msl_source)  # type: ignore[attr-defined]
+        metal_kernel._metal_cache = (source_hash, lib)  # type: ignore[attr-defined]
 
     tensor_args = [a for a in args if isinstance(a, torch.Tensor)]
     dispatch_fn = getattr(lib, kernel_name)
-    bx, by, bz = _block_dims
-    # Pad grid to 3D
-    gx = grid[0] if len(grid) > 0 else 1
-    gy = grid[1] if len(grid) > 1 else 1
-    gz = grid[2] if len(grid) > 2 else 1
-    total_threads = (gx * bx, gy * by, gz * bz)
-    group_size = (bx, by, bz)
-    dispatch_fn(*tensor_args, threads=total_threads, group_size=group_size)
+    total_threads = grid[0] * _block_size
+    dispatch_fn(*tensor_args, threads=total_threads, group_size=_block_size)

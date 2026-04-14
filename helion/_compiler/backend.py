@@ -1519,8 +1519,23 @@ class PallasBackend(Backend):
                     output_indices.append(i)
                     inplace_indices.append(i)
 
-        launcher_args = [*args, f"_output_indices={output_indices}"]
+        # Identify output-only arg names for codegen to capture return values.
+        # Remove them from positional args and pass as _output_only_tensors kwarg.
+        output_only_set = set(output_indices) - set(inplace_indices)
+        output_only_names: list[str] = []
+        if sorted_args is not None:
+            for i in output_indices:
+                if i in output_only_set:
+                    output_only_names.append(sorted_args[i].host_str())
+        self._output_only_names = output_only_names
+        filtered_args = [a for a in args if a not in output_only_names]
+
+        launcher_args = [*filtered_args, f"_output_indices={output_indices}"]
         launcher_args.append(f"_inplace_indices={inplace_indices}")
+        if output_only_names:
+            launcher_args.append(
+                f"_output_only_tensors=[{', '.join(output_only_names)}]"
+            )
 
         if has_rng_ops:
             launcher_args.insert(-1, "_rng_seed_buffer")
