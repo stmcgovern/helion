@@ -40,6 +40,7 @@ from torch.utils.weak import WeakIdKeyDictionary
 from .. import exc
 from .._compile_time import measure
 from .._compiler.ast_extension import unparse
+from .._compiler.autotuner_heuristics import compiler_seed_configs
 from .._compiler.backend import TritonBackend
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import TensorDescriptorLayoutGuard
@@ -491,6 +492,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     raise
 
                 self.env.config_spec.configure_epilogue_subtile_autotune(args)
+                self.env.config_spec.compiler_seed_configs = compiler_seed_configs(
+                    self.env, self.host_function.device_ir
+                )
 
     def _apply_mark_static(self, args: tuple[object, ...]) -> None:
         """
